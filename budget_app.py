@@ -13,16 +13,14 @@ SCOPES = [
 ]
 
 def connect_to_gsheet():
-    # Connect using Streamlit Secrets
     credentials = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
         scopes=SCOPES
     )
     client = gspread.authorize(credentials)
-    # Open the spreadsheet by name
     return client.open("budget_database")
 
-# --- AUTHENTICATION FUNCTIONS ---
+# --- AUTHENTICATION ---
 def make_hashes(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
@@ -33,21 +31,15 @@ def check_hashes(password, hashed_text):
 
 def create_user(sheet, username, password):
     users_worksheet = sheet.worksheet("Users")
-    # Check if user exists
-    existing_users = users_worksheet.col_values(1) # Column 1 is usernames
-    if username in existing_users:
+    if username in users_worksheet.col_values(1):
         return False
-    
-    # Add new user
     users_worksheet.append_row([username, make_hashes(password)])
     return True
 
 def login_user(sheet, username, password):
     users_worksheet = sheet.worksheet("Users")
     try:
-        # Find the cell with the username
         cell = users_worksheet.find(username)
-        # Get the password hash from the next column
         stored_hash = users_worksheet.cell(cell.row, cell.col + 1).value
         if check_hashes(password, stored_hash):
             return True
@@ -58,32 +50,28 @@ def login_user(sheet, username, password):
 # --- DATA FUNCTIONS ---
 def add_transaction(sheet, username, date, type_, category, amount, notes):
     ws = sheet.worksheet("Transactions")
-    # Store dates as string for Sheets compatibility
     ws.append_row([str(date), username, type_, category, amount, notes])
 
 def get_data(sheet, username):
     ws = sheet.worksheet("Transactions")
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    
-    # If sheet is empty, return empty df
     if df.empty:
         return pd.DataFrame(columns=['Date', 'Username', 'Type', 'Category', 'Amount', 'Notes'])
     
-    # Filter by username
     if 'Username' in df.columns:
         df = df[df['Username'] == username]
     
-    # Convert types safely
     if not df.empty:
         df['Date'] = pd.to_datetime(df['Date'])
         df['Amount'] = pd.to_numeric(df['Amount'])
+        df = df.sort_values(by='Date')
         
     return df
 
 # --- MAIN APP ---
 def main():
-    st.set_page_config(page_title="Cloud Budget", layout="wide")
+    st.set_page_config(page_title="Smart Budget", layout="wide")
     
     try:
         sheet = connect_to_gsheet()
@@ -95,9 +83,9 @@ def main():
         st.session_state['logged_in'] = False
         st.session_state['username'] = ''
 
-    # --- LOGIN PAGE ---
+    # --- LOGIN SCREEN ---
     if not st.session_state['logged_in']:
-        st.title("🔐 Cloud Budget Login")
+        st.title("🔐 Smart Budget Login")
         menu = ["Login", "Sign Up"]
         choice = st.selectbox("Menu", menu)
 
@@ -116,75 +104,127 @@ def main():
             new_user = st.text_input("New Username")
             new_password = st.text_input("New Password", type='password')
             if st.button("Create Account"):
-                # Initialize headers if first user
                 try:
                     u_ws = sheet.worksheet("Users")
-                    if not u_ws.row_values(1):
-                        u_ws.append_row(["Username", "PasswordHash"])
-                    
+                    if not u_ws.row_values(1): u_ws.append_row(["Username", "PasswordHash"])
                     t_ws = sheet.worksheet("Transactions")
-                    if not t_ws.row_values(1):
-                        t_ws.append_row(["Date", "Username", "Type", "Category", "Amount", "Notes"])
-                except:
-                    pass
+                    if not t_ws.row_values(1): t_ws.append_row(["Date", "Username", "Type", "Category", "Amount", "Notes"])
+                except: pass
+                if create_user(sheet, new_user, new_password): st.success("Created! Login now.")
+                else: st.error("Username taken.")
 
-                if create_user(sheet, new_user, new_password):
-                    st.success("Account created! Please log in.")
-                else:
-                    st.error("Username already taken.")
-
-    # --- DASHBOARD ---
+    # --- MAIN DASHBOARD ---
     else:
-        st.sidebar.title(f"Hi, {st.session_state['username']}")
+        st.sidebar.title(f"Wallet: {st.session_state['username']}")
         if st.sidebar.button("Logout"):
             st.session_state['logged_in'] = False
             st.rerun()
             
-        st.sidebar.header("Filters")
-        today = datetime.now()
-        selected_month = st.sidebar.slider("Month", 1, 12, today.month)
+        # Filters
+        st.sidebar.header("View Settings")
+        # Generate Month List
+        period_options = ["All Time"] + [datetime(2025, i, 1).strftime('%B') for i in range(1, 13)]
+        selected_period = st.sidebar.selectbox("Time Period", period_options)
         
-        # INPUT
-        with st.expander("➕ Add New Transaction"):
+        # --- INPUT SECTION ---
+        with st.expander("➕ Update Wallet / Add Transaction", expanded=False):
             col1, col2, col3, col4, col5 = st.columns(5)
             t_date = col1.date_input("Date")
-            t_type = col2.selectbox("Type", ["Income", "Need", "Want", "Saving"])
+            t_type = col2.selectbox("Type", ["Income", "Need", "Want", "Saving", "Debt"]) 
             t_cat = col3.text_input("Category")
-            t_amt = col4.number_input("Amount", min_value=0.0)
+            t_amt = col4.number_input("Amount", min_value=0.0, step=10.0)
             t_note = col5.text_input("Notes")
             
-            if st.button("Add Entry"):
+            if st.button("Record Transaction"):
                 add_transaction(sheet, st.session_state['username'], t_date, t_type, t_cat, t_amt, t_note)
-                st.success("Added to Google Sheet!")
+                st.success("Logged!")
                 st.rerun()
 
-        # METRICS
+        # --- DATA PROCESSING ---
         df = get_data(sheet, st.session_state['username'])
         
         if not df.empty:
-            df = df[df['Date'].dt.month == selected_month]
+            # 1. ALWAYS calculate global Running Balance (Current Net Worth)
+            df['Signed_Amount'] = df.apply(lambda x: x['Amount'] if x['Type'] == 'Income' else -x['Amount'], axis=1)
+            df['Running_Balance'] = df['Signed_Amount'].cumsum()
+            current_net_worth = df['Running_Balance'].iloc[-1]
+
+            # 2. Filter Data based on selection
+            filtered_df = df.copy()
+            if selected_period != "All Time":
+                filtered_df = filtered_df[filtered_df['Date'].dt.strftime('%B') == selected_period]
+
+            # --- TOP METRICS ---
+            # These change based on the filter (Monthly Stats vs All Time Stats)
+            income_period = filtered_df[filtered_df['Type'] == 'Income']['Amount'].sum()
+            expenses_period = filtered_df[filtered_df['Type'].isin(['Need', 'Want', 'Saving', 'Debt'])]['Amount'].sum()
+            savings_period = filtered_df[filtered_df['Type'] == 'Saving']['Amount'].sum()
             
-            # Simple aggregations
-            inc = df[df['Type'] == 'Income']['Amount'].sum() if not df[df['Type'] == 'Income'].empty else 0
-            needs = df[df['Type'] == 'Need']['Amount'].sum() if not df[df['Type'] == 'Need'].empty else 0
-            wants = df[df['Type'] == 'Want']['Amount'].sum() if not df[df['Type'] == 'Want'].empty else 0
-            savings = df[df['Type'] == 'Saving']['Amount'].sum() if not df[df['Type'] == 'Saving'].empty else 0
+            st.markdown(f"### 🏦 Snapshot: {selected_period}")
             
-            # Display
+            # Layout: 4 columns. 
+            # First column is ALWAYS Total Net Worth (Does not change with filter).
+            # Next 3 columns are Specific to the selected month/period.
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Income", f"${inc}")
-            m2.metric("Needs", f"${needs}")
-            m3.metric("Wants", f"${wants}")
-            m4.metric("Savings", f"${savings}")
+            m1.metric("💰 Total Wallet", f"${current_net_worth:,.2f}", help="Your total cash right now (All Time).")
+            m2.metric("Income", f"${income_period:,.2f}")
+            m3.metric("Expenses", f"${expenses_period:,.2f}", delta="-Outflow", delta_color="inverse")
+            m4.metric("Savings", f"${savings_period:,.2f}")
             
-            # Chart
-            st.subheader("Breakdown")
-            if needs + wants + savings > 0:
-                fig = px.pie(names=['Needs', 'Wants', 'Savings'], values=[needs, wants, savings])
-                st.plotly_chart(fig, use_container_width=True)
+            st.divider()
+
+            # --- HYBRID VISUALIZATION LOGIC ---
             
-            # Data Table
-            st.dataframe(df)
+            # CASE A: "All Time" Selected -> Show TRENDS (Line Chart)
+            if selected_period == "All Time":
+                st.subheader("📈 Wealth Growth (All Time)")
+                if not df.empty:
+                    fig_trend = px.line(df, x='Date', y='Running_Balance', markers=True, 
+                                        title="Net Worth Over Time")
+                    st.plotly_chart(fig_trend, use_container_width=True)
+                
+                # Show Total Pie Chart
+                st.subheader("Total Spending Habits")
+                expenses_only = df[df['Type'].isin(['Need', 'Want', 'Debt'])]
+                if not expenses_only.empty:
+                    fig_pie = px.pie(expenses_only, values='Amount', names='Type', hole=0.4)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+            # CASE B: Specific Month Selected -> Show BUDGET (Bar/Pie Charts)
+            else:
+                st.subheader(f"📊 Budget Breakdown: {selected_period}")
+                
+                if not filtered_df.empty:
+                    c1, c2 = st.columns(2)
+                    
+                    with c1:
+                        # Income vs Expenses Bar Chart
+                        st.caption("Income vs Outflow")
+                        # Simple dataframe for bar chart
+                        bar_data = pd.DataFrame({
+                            "Category": ["Income", "Expenses"],
+                            "Amount": [income_period, expenses_period]
+                        })
+                        fig_bar = px.bar(bar_data, x="Category", y="Amount", color="Category", 
+                                         color_discrete_map={"Income": "green", "Expenses": "red"})
+                        st.plotly_chart(fig_bar, use_container_width=True)
+                    
+                    with c2:
+                        # Detailed Pie Chart (Where did the money go?)
+                        st.caption("Expense Categories")
+                        expenses_only = filtered_df[filtered_df['Type'] != 'Income']
+                        if not expenses_only.empty:
+                            fig_pie = px.pie(expenses_only, values='Amount', names='Category', hole=0.4)
+                            st.plotly_chart(fig_pie, use_container_width=True)
+                        else:
+                            st.info("No expenses logged this month.")
+                else:
+                    st.info(f"No transactions found for {selected_period}.")
+
+            # --- RAW DATA ---
+            with st.expander("View Transaction History"):
+                st.dataframe(filtered_df[['Date', 'Type', 'Category', 'Amount', 'Notes']].sort_values(by='Date', ascending=False), 
+                             use_container_width=True)
 
 if __name__ == '__main__':
     main()
