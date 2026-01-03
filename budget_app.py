@@ -165,33 +165,44 @@ def main():
                 past_df['Signed_Amount'] = past_df.apply(lambda x: x['Amount'] if x['Type'] == 'Income' else -x['Amount'], axis=1)
                 current_net_worth = past_df['Signed_Amount'].sum()
                 
-                # 2. Future Data
+                # 2. Future Data (Future Needs AND Future Debt)
                 future_df = df[df['Date'].dt.date > today_date].copy()
-                future_needs = future_df[future_df['Type'] == 'Need']['Amount'].sum()
+                # FIX: Include 'Debt' in future obligations logic
+                future_obligations = future_df[future_df['Type'].isin(['Need', 'Debt'])]['Amount'].sum()
                 
                 # 3. Savings Analysis
                 total_savings_cash = past_df[past_df['Type'] == 'Saving']['Amount'].sum()
-                free_savings = total_savings_cash - future_needs
+                free_savings = total_savings_cash - future_obligations
 
                 # --- TOP METRICS ---
                 st.markdown(f"### 🏦 Current Standing (As of {today_date})")
                 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("💰 Current Wallet", f"${current_net_worth:,.2f}", 
-                          help="Money you physically have right now. Does NOT include future bills.")
+                          help="Money you physically have right now.")
                 
                 m2.metric("🛡️ Free Savings", f"${free_savings:,.2f}", 
-                          delta=f"-${future_needs:,.2f} Reserved" if future_needs > 0 else "All Clear",
-                          help="Total Savings minus any Future Needs you have scheduled.")
+                          delta=f"-${future_obligations:,.2f} Reserved" if future_obligations > 0 else "All Clear",
+                          help="Total Savings minus any Future Needs/Debt you have scheduled.")
                 
-                m3.metric("📅 Future Needs", f"${future_needs:,.2f}")
+                m3.metric("📅 Future Obligations", f"${future_obligations:,.2f}", 
+                          help="Sum of Needs + Debt scheduled for future dates.")
                 
+                # Metric 4 Changes based on View
                 if selected_period != "All Time":
                     month_df = df[df['Date'].dt.strftime('%B') == selected_period]
-                    month_spend = month_df[month_df['Type'].isin(['Need', 'Want'])]['Amount'].sum()
-                    m4.metric(f"{selected_period} Spending", f"${month_spend:,.2f}")
+                    # FIX: Include Debt in monthly spending, but maybe separate it visually?
+                    living_expenses = month_df[month_df['Type'].isin(['Need', 'Want'])]['Amount'].sum()
+                    debt_paid = month_df[month_df['Type'] == 'Debt']['Amount'].sum()
+                    
+                    # We can combine them or show Debt explicitly
+                    if debt_paid > 0:
+                        m4.metric(f"{selected_period} Debt Paid", f"${debt_paid:,.2f}", delta="Payoff!")
+                    else:
+                        m4.metric(f"{selected_period} Living Cost", f"${living_expenses:,.2f}")
                 else:
-                    m4.metric("Total Debt Paid", f"${past_df[past_df['Type'] == 'Debt']['Amount'].sum():,.2f}")
+                    total_debt_paid = past_df[past_df['Type'] == 'Debt']['Amount'].sum()
+                    m4.metric("Total Debt Paid (All Time)", f"${total_debt_paid:,.2f}")
 
                 st.divider()
 
@@ -203,7 +214,6 @@ def main():
                     df_proj['Signed_Amount'] = df_proj.apply(lambda x: x['Amount'] if x['Type'] == 'Income' else -x['Amount'], axis=1)
                     df_proj['Running_Balance'] = df_proj['Signed_Amount'].cumsum()
                     
-                    # Color status
                     df_proj['Status'] = df_proj['Date'].dt.date.apply(lambda x: 'Future' if x > today_date else 'History')
                     
                     fig_trend = px.line(df_proj, x='Date', y='Running_Balance', 
@@ -212,10 +222,8 @@ def main():
                                         color_discrete_map={'History': 'blue', 'Future': 'orange'},
                                         title="Balance Trajectory (Blue = Real, Orange = Projected)")
                     
-                    # === FIX: Convert 'today_date' to numeric milliseconds for Plotly ===
-                    # We combine today's date with min time (00:00:00) then get timestamp * 1000
-                    today_numeric = datetime.combine(today_date, datetime.min.time()).timestamp() * 1000
-                    
+                    # FIX: Timezone-safe timestamp conversion for Plotly
+                    today_numeric = pd.Timestamp(today_date).timestamp() * 1000
                     fig_trend.add_vline(x=today_numeric, line_dash="dash", line_color="green", annotation_text="Today")
                     
                     st.plotly_chart(fig_trend, use_container_width=True)
@@ -228,15 +236,17 @@ def main():
                     if not month_df.empty:
                         c1, c2 = st.columns(2)
                         with c1:
-                            st.caption("Income vs Expenses")
+                            st.caption("Income vs Outflow")
                             inc = month_df[month_df['Type'] == 'Income']['Amount'].sum()
+                            # FIX: Include Debt in Expenses Bar
                             exp = month_df[month_df['Type'].isin(['Need', 'Want', 'Debt'])]['Amount'].sum()
+                            
                             bar_data = pd.DataFrame({"Cat": ["Income", "Expenses"], "Val": [inc, exp]})
                             fig_bar = px.bar(bar_data, x="Cat", y="Val", color="Cat", color_discrete_map={"Income": "green", "Expenses": "red"})
                             st.plotly_chart(fig_bar, use_container_width=True)
                         
                         with c2:
-                            st.caption("Expense Breakdown")
+                            st.caption("Expense Breakdown (Includes Debt)")
                             exp_only = month_df[month_df['Type'] != 'Income']
                             if not exp_only.empty:
                                 fig_pie = px.pie(exp_only, values='Amount', names='Category', hole=0.4)
